@@ -2,7 +2,7 @@
 
 Direct, encrypted, browser-to-browser file transfer. No upload, no account, no signaling server.
 
-**Live:** https://vaultlink.onrender.com
+**Live:** https://vaultlink-fmyy.onrender.com
 
 Vaultlink opens a real WebRTC `RTCDataChannel` between two browsers and streams files across it. Connection setup is a manual copy-paste of two codes through any chat app, so there is no backend of any kind. Everything is plain HTML, CSS, and JavaScript.
 
