@@ -6,7 +6,13 @@
   const BUFFER_HIGH = 1048576;
   const BUFFER_LOW = 262144;
   const ICE_GATHER_TIMEOUT = 7000;
-  const CODE_PREFIX = 'VL1.';
+  const CODE_PREFIX = 'VL2.';
+  const MAX_CANDIDATES = 12;
+  const KIND_NAMES = ['host', 'srflx', 'relay', 'prflx'];
+  const KIND_PREF = [126, 100, 0, 110];
+  const SETUP_NAMES = ['actpass', 'active', 'passive'];
+  const UUID_RE = /^([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})\.local$/i;
+  const DAMAGED = 'The code is damaged or incomplete. Copy it again in full.';
   const RTC_CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -84,6 +90,250 @@
   let sending = false;
   let uid = 0;
   let objectUrls = [];
+
+  function hexToBytes(hex) {
+    const out = [];
+    for (let i = 0; i < hex.length; i += 2) out.push(parseInt(hex.substr(i, 2), 16));
+    return out;
+  }
+
+  function bytesToHex(bytes) {
+    return bytes.map((b) => (b < 16 ? '0' : '') + b.toString(16)).join('');
+  }
+
+  function parseIPv4(str) {
+    const parts = str.split('.');
+    if (parts.length !== 4) return null;
+    const out = [];
+    for (const p of parts) {
+      if (!/^\d{1,3}$/.test(p)) return null;
+      const n = parseInt(p, 10);
+      if (n > 255) return null;
+      out.push(n);
+    }
+    return out;
+  }
+
+  function parseIPv6(str) {
+    const clean = str.split('%')[0];
+    if (clean.indexOf('.') !== -1) return null;
+    const halves = clean.split('::');
+    if (halves.length > 2) return null;
+    const toGroups = (s) => (s === '' ? [] : s.split(':'));
+    const head = toGroups(halves[0]);
+    const tail = halves.length === 2 ? toGroups(halves[1]) : [];
+    let groups;
+    if (halves.length === 2) {
+      const fill = 8 - head.length - tail.length;
+      if (fill < 1) return null;
+      groups = head.concat(new Array(fill).fill('0'), tail);
+    } else {
+      groups = head;
+    }
+    if (groups.length !== 8) return null;
+    const out = [];
+    for (const g of groups) {
+      if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
+      const n = parseInt(g, 16);
+      out.push(n >> 8, n & 255);
+    }
+    return out;
+  }
+
+  function formatIPv6(bytes) {
+    const groups = [];
+    for (let i = 0; i < 16; i += 2) groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+    return groups.join(':');
+  }
+
+  function crc16(bytes) {
+    let crc = 0xffff;
+    for (const b of bytes) {
+      crc ^= b << 8;
+      for (let i = 0; i < 8; i += 1) {
+        crc = (crc & 0x8000) ? (((crc << 1) ^ 0x1021) & 0xffff) : ((crc << 1) & 0xffff);
+      }
+    }
+    return crc;
+  }
+
+  function toBase64Url(bytes) {
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function fromBase64Url(str) {
+    let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    const bin = atob(b64);
+    const out = [];
+    for (let i = 0; i < bin.length; i += 1) out.push(bin.charCodeAt(i));
+    return out;
+  }
+
+  function pushString(out, str) {
+    if (str.length > 255) throw new Error('Unsupported connection details.');
+    out.push(str.length);
+    for (let i = 0; i < str.length; i += 1) out.push(str.charCodeAt(i) & 127);
+  }
+
+  function sdpValue(lines, prefix) {
+    for (const line of lines) {
+      if (line.indexOf(prefix) === 0) return line.slice(prefix.length).trim();
+    }
+    return null;
+  }
+
+  function encodeDescription(desc) {
+    const lines = desc.sdp.split(/\r?\n/);
+    const ufrag = sdpValue(lines, 'a=ice-ufrag:');
+    const pwd = sdpValue(lines, 'a=ice-pwd:');
+    const fp = sdpValue(lines, 'a=fingerprint:');
+    const setup = sdpValue(lines, 'a=setup:');
+    const mid = sdpValue(lines, 'a=mid:') || '0';
+    if (!ufrag || !pwd || !fp || !setup) throw new Error('Could not read the connection details. Try again.');
+    const fpParts = fp.split(/\s+/);
+    const fpBytes = fpParts.length === 2 ? hexToBytes(fpParts[1].replace(/:/g, '')) : [];
+    if (fpParts[0].toLowerCase() !== 'sha-256' || fpBytes.length !== 32) {
+      throw new Error('This browser uses an unsupported certificate fingerprint.');
+    }
+    const setupIdx = SETUP_NAMES.indexOf(setup);
+    if (setupIdx < 0) throw new Error('Unsupported connection details.');
+
+    const out = [(desc.type === 'answer' ? 1 : 0) | (setupIdx << 1)];
+    fpBytes.forEach((b) => out.push(b));
+    pushString(out, ufrag);
+    pushString(out, pwd);
+    pushString(out, mid);
+
+    const seen = {};
+    const cands = [];
+    for (const line of lines) {
+      if (line.indexOf('a=candidate:') !== 0 || cands.length >= MAX_CANDIDATES) continue;
+      const p = line.slice(12).trim().split(/\s+/);
+      if (p.length < 8 || p[2].toLowerCase() !== 'udp' || p[6] !== 'typ') continue;
+      const kind = KIND_NAMES.indexOf(p[7]);
+      const port = parseInt(p[5], 10);
+      if (kind < 0 || !(port > 0 && port < 65536)) continue;
+      let flags = kind;
+      let addr = null;
+      const v4 = parseIPv4(p[4]);
+      if (v4) {
+        if (v4[0] === 169 && v4[1] === 254) continue;
+        addr = v4;
+      } else {
+        const m = UUID_RE.exec(p[4]);
+        if (m) {
+          flags |= 8;
+          addr = hexToBytes(m.slice(1).join(''));
+        } else {
+          const v6 = parseIPv6(p[4]);
+          if (!v6 || (v6[0] === 0xfe && (v6[1] & 0xc0) === 0x80)) continue;
+          flags |= 4;
+          addr = v6;
+        }
+      }
+      const key = flags + ':' + addr.join('.') + ':' + port;
+      if (seen[key]) continue;
+      seen[key] = true;
+      cands.push({ flags, port, addr });
+    }
+    if (!cands.length) throw new Error('No network candidates were found. Check your connection and try again.');
+
+    out.push(cands.length);
+    cands.forEach((c) => {
+      out.push(c.flags, c.port >> 8, c.port & 255);
+      c.addr.forEach((b) => out.push(b));
+    });
+    const sum = crc16(out);
+    out.push(sum >> 8, sum & 255);
+    return CODE_PREFIX + toBase64Url(out);
+  }
+
+  function decodeDescription(raw, expected) {
+    const code = String(raw || '').replace(/\s+/g, '');
+    if (!code) throw new Error('Paste a code first.');
+    if (code.indexOf(CODE_PREFIX) !== 0) {
+      throw new Error('That is not a Vaultlink code. Codes from older versions will not work.');
+    }
+    let type;
+    let sdp;
+    try {
+      const bytes = fromBase64Url(code.slice(CODE_PREFIX.length));
+      if (bytes.length < 44) throw new Error(DAMAGED);
+      const body = bytes.slice(0, -2);
+      if (crc16(body) !== ((bytes[bytes.length - 2] << 8) | bytes[bytes.length - 1])) throw new Error(DAMAGED);
+      let pos = 0;
+      const next = () => {
+        if (pos >= body.length) throw new Error(DAMAGED);
+        pos += 1;
+        return body[pos - 1];
+      };
+      const take = (n) => {
+        const chunk = [];
+        for (let i = 0; i < n; i += 1) chunk.push(next());
+        return chunk;
+      };
+      const readString = () => String.fromCharCode.apply(null, take(next()));
+
+      const head = next();
+      type = (head & 1) ? 'answer' : 'offer';
+      const setupIdx = (head >> 1) & 3;
+      if (setupIdx > 2) throw new Error(DAMAGED);
+      const fpHex = bytesToHex(take(32)).toUpperCase().match(/../g).join(':');
+      const ufrag = readString();
+      const pwd = readString();
+      const mid = readString();
+      const count = next();
+      const candLines = [];
+      for (let i = 0; i < count; i += 1) {
+        const flags = next();
+        const port = (next() << 8) | next();
+        const kind = flags & 3;
+        let host;
+        if (flags & 8) {
+          const h = bytesToHex(take(16));
+          host = [h.slice(0, 8), h.slice(8, 12), h.slice(12, 16), h.slice(16, 20), h.slice(20)].join('-') + '.local';
+        } else if (flags & 4) {
+          host = formatIPv6(take(16));
+        } else {
+          host = take(4).join('.');
+        }
+        const priority = KIND_PREF[kind] * 16777216 + (65535 - i) * 256 + 255;
+        let line = 'a=candidate:' + (i + 1) + ' 1 udp ' + priority + ' ' + host + ' ' + port + ' typ ' + KIND_NAMES[kind];
+        if (kind === 1 || kind === 2) line += ' raddr 0.0.0.0 rport 0';
+        candLines.push(line);
+      }
+      if (pos !== body.length || !count) throw new Error(DAMAGED);
+
+      sdp = [
+        'v=0',
+        'o=- 4611731400430051336 2 IN IP4 127.0.0.1',
+        's=-',
+        't=0 0',
+        'a=group:BUNDLE ' + mid,
+        'a=msid-semantic: WMS',
+        'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
+        'c=IN IP4 0.0.0.0',
+        'a=ice-ufrag:' + ufrag,
+        'a=ice-pwd:' + pwd,
+        'a=fingerprint:sha-256 ' + fpHex,
+        'a=setup:' + SETUP_NAMES[setupIdx],
+        'a=mid:' + mid,
+        'a=sctp-port:5000',
+        'a=max-message-size:262144'
+      ].concat(candLines, ['a=end-of-candidates']).join('\r\n') + '\r\n';
+    } catch (e) {
+      throw new Error(DAMAGED);
+    }
+    if (type !== expected) {
+      throw new Error(expected === 'offer'
+        ? 'This is a reply code. Paste the invite code here.'
+        : 'This is an invite code. Paste the reply code here.');
+    }
+    return { type, sdp };
+  }
 
   function setStatus(kind, text) {
     dot.dataset.state = kind;
@@ -196,37 +446,6 @@
     });
   }
 
-  function encodeDescription(desc) {
-    return CODE_PREFIX + btoa(JSON.stringify({ t: desc.type, s: desc.sdp }));
-  }
-
-  function decodeDescription(raw, expected) {
-    const code = String(raw || '').replace(/\s+/g, '');
-    if (!code) throw new Error('Paste a code first.');
-    if (code.indexOf(CODE_PREFIX) !== 0) throw new Error('That is not a Vaultlink code.');
-    let obj;
-    try {
-      obj = JSON.parse(atob(code.slice(CODE_PREFIX.length)));
-    } catch (e) {
-      throw new Error('The code is damaged or incomplete. Copy it again in full.');
-    }
-    if (!obj || typeof obj.s !== 'string' || typeof obj.t !== 'string') {
-      throw new Error('The code is damaged or incomplete. Copy it again in full.');
-    }
-    if (obj.t !== expected) {
-      throw new Error(expected === 'offer'
-        ? 'This is a reply code. Paste the invite code here.'
-        : 'This is an invite code. Paste the reply code here.');
-    }
-    return { type: obj.t, sdp: obj.s };
-  }
-
-  function assertCandidates(desc) {
-    if (!desc || desc.sdp.indexOf('a=candidate') === -1) {
-      throw new Error('No network candidates were found. Check your connection and try again.');
-    }
-  }
-
   async function run(btn, busyLabel, task) {
     const label = btn.textContent;
     btn.disabled = true;
@@ -334,7 +553,6 @@
     await peer.setLocalDescription(offer);
     await waitForGathering(peer);
     if (peer !== pc) return;
-    assertCandidates(peer.localDescription);
     setOutput(inviteOut, btnCopyInvite, encodeDescription(peer.localDescription));
     showMsg('Invite ready. Copy it, send it, then paste the reply you get back.', 'ok');
   }
@@ -358,7 +576,6 @@
     await peer.setLocalDescription(answer);
     await waitForGathering(peer);
     if (peer !== pc) return;
-    assertCandidates(peer.localDescription);
     setOutput(replyOut, btnCopyReply, encodeDescription(peer.localDescription));
     showMsg('Reply ready. Copy it and send it back. This page connects once they finish.', 'ok');
   }
