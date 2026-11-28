@@ -999,3 +999,31 @@ textarea {
     right: auto;
   }
 }
+
+.scanner-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: #000000;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.scanner-overlay[data-kind="error"] {
+  color: #f0a49c;
+}
+
+.scanner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.hint[data-kind="error"] {
+  color: var(--bad);
+}
