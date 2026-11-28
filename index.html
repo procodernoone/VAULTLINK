@@ -4,20 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Vaultlink: Free P2P Encrypted File Transfer in Your Browser</title>
-  <meta name="description" content="Send files directly between browsers with WebRTC. End-to-end encrypted, no upload, no signup, no server. Free, open source peer-to-peer file sharing.">
+  <meta name="description" content="Send files directly between browsers with WebRTC. End-to-end encrypted, no upload, no signup, no server. Pair with a QR code, works offline on the same Wi-Fi.">
   <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
   <meta name="author" content="Abir Hossain Shwapno">
   <meta name="referrer" content="strict-origin-when-cross-origin">
   <meta name="theme-color" content="#14161a">
   <meta name="color-scheme" content="dark">
-  <link rel="canonical" href="https://vaultlink.onrender.com/">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Vaultlink">
+  <link rel="canonical" href="https://vaultlink-fmyy.onrender.com/">
+  <link rel="manifest" href="manifest.webmanifest">
 
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Vaultlink">
   <meta property="og:title" content="Vaultlink: Free P2P Encrypted File Transfer in Your Browser">
   <meta property="og:description" content="Send files directly between browsers with WebRTC. End-to-end encrypted, no upload, no signup, no server.">
-  <meta property="og:url" content="https://vaultlink.onrender.com/">
-  <meta property="og:image" content="https://vaultlink.onrender.com/og-image.png">
+  <meta property="og:url" content="https://vaultlink-fmyy.onrender.com/">
+  <meta property="og:image" content="https://vaultlink-fmyy.onrender.com/og-image.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="Vaultlink: direct encrypted file transfer between browsers">
@@ -26,7 +30,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Vaultlink: Free P2P Encrypted File Transfer in Your Browser">
   <meta name="twitter:description" content="Send files directly between browsers with WebRTC. End-to-end encrypted, no upload, no signup, no server.">
-  <meta name="twitter:image" content="https://vaultlink.onrender.com/og-image.png">
+  <meta name="twitter:image" content="https://vaultlink-fmyy.onrender.com/og-image.png">
   <meta name="twitter:image:alt" content="Vaultlink: direct encrypted file transfer between browsers">
 
   <link rel="icon" type="image/x-icon" href="favicon.ico">
@@ -40,23 +44,23 @@
     "@graph": [
       {
         "@type": "WebSite",
-        "@id": "https://vaultlink.onrender.com/#website",
-        "url": "https://vaultlink.onrender.com/",
+        "@id": "https://vaultlink-fmyy.onrender.com/#website",
+        "url": "https://vaultlink-fmyy.onrender.com/",
         "name": "Vaultlink",
         "description": "Free peer-to-peer encrypted file transfer between browsers using WebRTC.",
         "inLanguage": "en",
-        "publisher": { "@id": "https://vaultlink.onrender.com/#author" }
+        "publisher": { "@id": "https://vaultlink-fmyy.onrender.com/#author" }
       },
       {
         "@type": "WebApplication",
-        "@id": "https://vaultlink.onrender.com/#app",
+        "@id": "https://vaultlink-fmyy.onrender.com/#app",
         "name": "Vaultlink",
-        "url": "https://vaultlink.onrender.com/",
+        "url": "https://vaultlink-fmyy.onrender.com/",
         "description": "Send files directly from one browser to another over an encrypted WebRTC data channel. No upload, no account, no signaling server.",
         "applicationCategory": "UtilitiesApplication",
         "operatingSystem": "Any",
         "browserRequirements": "Requires a modern browser with WebRTC support (Chrome, Firefox, Safari, Edge).",
-        "image": "https://vaultlink.onrender.com/og-image.png",
+        "image": "https://vaultlink-fmyy.onrender.com/og-image.png",
         "isAccessibleForFree": true,
         "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
         "featureList": [
@@ -64,14 +68,15 @@
           "End-to-end encryption through WebRTC DTLS",
           "No file upload to any server",
           "No account or signup",
-          "Manual copy-paste signaling with no signaling server",
+          "QR code pairing with a built-in scanner",
+          "Works offline on a local network after the first visit",
           "Chunked transfer with backpressure for large files"
         ],
-        "author": { "@id": "https://vaultlink.onrender.com/#author" }
+        "author": { "@id": "https://vaultlink-fmyy.onrender.com/#author" }
       },
       {
         "@type": "Person",
-        "@id": "https://vaultlink.onrender.com/#author",
+        "@id": "https://vaultlink-fmyy.onrender.com/#author",
         "name": "Abir Hossain Shwapno",
         "alternateName": "MD. Abir Hossain Shwapno",
         "url": "https://abir-hossain-shwapno.onrender.com",
@@ -146,20 +151,30 @@
             <ol class="steps">
               <li>
                 <div class="step-body">
-                  <p class="step-title">Create an invite code</p>
-                  <p class="step-help">Send it to the other person through any chat app.</p>
+                  <p class="step-title">Create an invite</p>
+                  <p class="step-help">Show the QR code to the other device, or send them the code in any chat app.</p>
                   <button id="btn-create" class="btn btn-primary" type="button">Create invite</button>
                   <div class="field">
-                    <textarea id="invite-out" class="code" readonly rows="4" placeholder="Your invite code appears here" spellcheck="false"></textarea>
+                    <textarea id="invite-out" class="code" readonly rows="3" placeholder="Your invite code appears here" spellcheck="false"></textarea>
                     <button id="btn-copy-invite" class="btn btn-ghost" type="button" disabled>Copy</button>
+                  </div>
+                  <div id="invite-qr-wrap" class="qr-wrap" hidden>
+                    <canvas id="invite-qr" class="qr" role="img" aria-label="QR code of the invite"></canvas>
+                    <p class="qr-note">On the other device choose "I'm joining", then "Scan invite QR".</p>
                   </div>
                 </div>
               </li>
               <li>
                 <div class="step-body">
-                  <p class="step-title">Paste their reply code</p>
-                  <p class="step-help">They will send one back after pasting your invite.</p>
-                  <textarea id="reply-in" class="code" rows="4" placeholder="Paste the reply code here" spellcheck="false"></textarea>
+                  <p class="step-title">Get their reply</p>
+                  <p class="step-help">Scan the QR code on their screen, or paste the reply code they send you.</p>
+                  <div class="btn-row">
+                    <button id="btn-scan-reply" class="btn btn-ghost" type="button">
+                      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+                      Scan reply QR
+                    </button>
+                  </div>
+                  <textarea id="reply-in" class="code" rows="3" placeholder="Or paste the reply code here" spellcheck="false"></textarea>
                   <button id="btn-finish" class="btn btn-primary" type="button">Finish connection</button>
                 </div>
               </li>
@@ -170,19 +185,29 @@
             <ol class="steps">
               <li>
                 <div class="step-body">
-                  <p class="step-title">Paste the invite code</p>
-                  <p class="step-help">The code the other person sent you.</p>
-                  <textarea id="invite-in" class="code" rows="4" placeholder="Paste the invite code here" spellcheck="false"></textarea>
+                  <p class="step-title">Get the invite</p>
+                  <p class="step-help">Scan the QR code on their screen, or paste the invite code they sent you.</p>
+                  <div class="btn-row">
+                    <button id="btn-scan-invite" class="btn btn-ghost" type="button">
+                      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+                      Scan invite QR
+                    </button>
+                  </div>
+                  <textarea id="invite-in" class="code" rows="3" placeholder="Or paste the invite code here" spellcheck="false"></textarea>
                   <button id="btn-reply" class="btn btn-primary" type="button">Generate reply</button>
                 </div>
               </li>
               <li>
                 <div class="step-body">
-                  <p class="step-title">Send the reply code back</p>
-                  <p class="step-help">Once they paste it and finish, this page connects by itself.</p>
+                  <p class="step-title">Send the reply back</p>
+                  <p class="step-help">Let them scan this QR code, or send them the code. This page connects once they finish.</p>
                   <div class="field">
-                    <textarea id="reply-out" class="code" readonly rows="4" placeholder="Your reply code appears here" spellcheck="false"></textarea>
+                    <textarea id="reply-out" class="code" readonly rows="3" placeholder="Your reply code appears here" spellcheck="false"></textarea>
                     <button id="btn-copy-reply" class="btn btn-ghost" type="button" disabled>Copy</button>
+                  </div>
+                  <div id="reply-qr-wrap" class="qr-wrap" hidden>
+                    <canvas id="reply-qr" class="qr" role="img" aria-label="QR code of the reply"></canvas>
+                    <p class="qr-note">On the other device tap "Scan reply QR".</p>
                   </div>
                 </div>
               </li>
@@ -240,7 +265,7 @@
       <ol class="how">
         <li>
           <strong>Exchange two codes</strong>
-          <span>One person creates an invite code and sends it through any chat app. The other pastes it and sends a reply code back.</span>
+          <span>One device shows an invite QR code. The other scans it and shows a reply QR code back. Codes can also be copied and pasted through any chat app.</span>
         </li>
         <li>
           <strong>Browsers connect directly</strong>
@@ -265,12 +290,12 @@
           <p>WebRTC encrypts every data channel with DTLS. With no server in the middle, only the two peers can read the data.</p>
         </article>
         <article>
-          <h3>No account, no server</h3>
-          <p>Signaling is manual copy and paste. Vaultlink runs as static files with nothing to sign up for.</p>
+          <h3>QR pairing, no accounts</h3>
+          <p>Scan a QR code to connect two devices in the same room. Vaultlink runs as static files with nothing to sign up for.</p>
         </article>
         <article>
-          <h3>Works in modern browsers</h3>
-          <p>Chrome, Firefox, Safari, and Edge on desktop and mobile, with no extension or install.</p>
+          <h3>Works offline on a local network</h3>
+          <p>After the first visit the app is cached, so two devices on the same Wi-Fi or hotspot can transfer files without internet access.</p>
         </article>
         <article>
           <h3>Built for large files</h3>
@@ -298,8 +323,12 @@
         <p>Vaultlink sets no limit. The receiving browser holds the file in memory until the transfer completes, so very large files are limited by the receiver's available RAM.</p>
       </div>
       <div class="faq-item">
-        <h3>Why do I have to copy and paste codes?</h3>
-        <p>Two browsers cannot find each other without exchanging connection details first. Most tools use a signaling server for that. Vaultlink skips the server, so you pass the codes through any chat app instead.</p>
+        <h3>Why do I need a code or a QR scan to connect?</h3>
+        <p>Two browsers cannot find each other without exchanging connection details first. Most tools use a signaling server for that. Vaultlink skips the server, so the two devices swap a short code instead, either by scanning a QR code or through any chat app.</p>
+      </div>
+      <div class="faq-item">
+        <h3>Does Vaultlink work offline?</h3>
+        <p>Yes, after you have opened it once online. Two devices on the same Wi-Fi network or phone hotspot can pair by QR code and transfer files with no internet access. Some routers block devices from talking to each other (client isolation), which prevents a direct connection.</p>
       </div>
       <div class="faq-item">
         <h3>Why does it not work when I open the file from my computer?</h3>
@@ -316,6 +345,20 @@
     </section>
 
   </main>
+
+  <div id="scanner" class="scanner" role="dialog" aria-modal="true" aria-labelledby="scanner-title" hidden>
+    <div class="scanner-box">
+      <div class="scanner-head">
+        <p id="scanner-title" class="scanner-title">Scan QR code</p>
+        <button id="scanner-close" class="btn btn-ghost" type="button">Close</button>
+      </div>
+      <div class="scanner-view">
+        <video id="scanner-video" playsinline muted></video>
+        <div class="scanner-frame"></div>
+      </div>
+      <p id="scanner-status" class="hint"></p>
+    </div>
+  </div>
 
   <footer class="footer">
     <p class="footer-note">Files move between browsers over an encrypted WebRTC channel.</p>
