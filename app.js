@@ -86,8 +86,11 @@
   const replyQr = $('reply-qr');
   const scanner = $('scanner');
   const scannerVideo = $('scanner-video');
+  const scannerOverlay = $('scanner-overlay');
   const scannerStatus = $('scanner-status');
   const scannerClose = $('scanner-close');
+  const scannerPhotoBtn = $('scanner-photo-btn');
+  const scannerPhoto = $('scanner-photo');
   const dropzone = $('dropzone');
   const fileInput = $('file-input');
   const queueList = $('queue');
@@ -107,7 +110,8 @@
   let sending = false;
   let uid = 0;
   let objectUrls = [];
-  let scanState = null;
+  let scanSession = null;
+  let jsQrPromise = null;
 
   function hexToBytes(hex) {
     const out = [];
@@ -698,6 +702,13 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function isWebView() {
+    const ua = navigator.userAgent || '';
+    if (/; wv\)/.test(ua)) return true;
+    if (/FBAN|FBAV|Instagram|Line\/|MicroMessenger|Snapchat/.test(ua)) return true;
+    return /(iPhone|iPad|iPod)/.test(ua) && !/Safari\//.test(ua);
+  }
+
   function checkEnvironment() {
     const lines = [];
     if (location.protocol === 'file:') {
@@ -708,12 +719,6 @@
     if (!window.RTCPeerConnection) {
       lines.push('This browser does not support WebRTC.');
       [btnCreate, btnFinish, btnReply].forEach((b) => { b.disabled = true; });
-    }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      [btnScanReply, btnScanInvite].forEach((b) => {
-        b.disabled = true;
-        b.title = 'Camera access needs https:// or http://localhost';
-      });
     }
     if (lines.length) {
       warningText.textContent = lines.join(' ');
@@ -967,43 +972,130 @@
     });
   }
 
-  function describeCameraError(err) {
-    if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
-      return 'Camera permission was denied. Allow camera access for this site and try again.';
+  function ensureJsQr() {
+    if (window.jsQR) return Promise.resolve();
+    if (!jsQrPromise) {
+      jsQrPromise = loadScript('jsQR.js').catch((err) => {
+        jsQrPromise = null;
+        throw err;
+      });
     }
-    if (err && err.name === 'NotFoundError') return 'No camera was found on this device.';
+    return jsQrPromise;
+  }
+
+  async function requestCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Live camera needs https:// or http://localhost. Use "Scan from photo" below instead.');
+    }
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+        audio: false
+      });
+    } catch (err) {
+      if (err && (err.name === 'OverconstrainedError' || err.name === 'NotFoundError')) {
+        return navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
+      throw err;
+    }
+  }
+
+  async function describeCameraError(err) {
+    const name = err && err.name;
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      let state = '';
+      try {
+        state = (await navigator.permissions.query({ name: 'camera' })).state;
+      } catch (e) {
+        state = '';
+      }
+      if (state === 'denied') {
+        return 'Camera is blocked for this site. Open your browser\'s site settings, set Camera to Allow, then reload the page. You can also use "Scan from photo" below.';
+      }
+      if (isWebView()) {
+        return 'This app\'s built-in browser does not allow camera access. Open Vaultlink in Chrome or Safari, or use "Scan from photo" below.';
+      }
+      return 'Camera access was not granted. Allow it when your browser asks, or use "Scan from photo" below.';
+    }
+    if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      return 'No camera was found on this device. Use "Scan from photo" below instead.';
+    }
+    if (name === 'NotReadableError') {
+      return 'The camera is being used by another app. Close it and try again.';
+    }
     return err && err.message ? err.message : 'Could not start the camera.';
   }
 
-  function closeScanner() {
-    if (!scanState) return;
-    scanState.stopped = true;
-    clearTimeout(scanState.timer);
-    scanState.stream.getTracks().forEach((t) => t.stop());
+  function showScannerOverlay(text, isError) {
+    scannerOverlay.textContent = text;
+    scannerOverlay.dataset.kind = isError ? 'error' : '';
+    scannerOverlay.hidden = false;
+  }
+
+  function setScanStatus(text, kind) {
+    scannerStatus.textContent = text;
+    scannerStatus.dataset.kind = kind || '';
+  }
+
+  function stopCamera(session) {
+    session.stopped = true;
+    clearTimeout(session.timer);
+    if (session.stream) {
+      session.stream.getTracks().forEach((t) => t.stop());
+      session.stream = null;
+    }
     scannerVideo.srcObject = null;
-    scanState = null;
+  }
+
+  function closeScanner() {
+    if (!scanSession) return;
+    const session = scanSession;
+    scanSession = null;
+    stopCamera(session);
     scanner.hidden = true;
   }
 
-  async function openScanner(onCode) {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('Camera access needs https:// or http://localhost.');
-    }
-    if (!window.jsQR) await loadScript('jsQR.js');
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } },
-      audio: false
-    });
-    const state = { stream, stopped: false, timer: null };
-    scanState = state;
-    scannerVideo.srcObject = stream;
+  async function startScan(onCode) {
+    clearMsg();
+    closeScanner();
+    const session = { onCode, stream: null, stopped: false, timer: null };
+    scanSession = session;
     scanner.hidden = false;
-    scannerStatus.textContent = 'Point the camera at the QR code.';
-    await scannerVideo.play();
+    setScanStatus('', '');
+    showScannerOverlay('Starting camera. Allow camera access if your browser asks.', false);
+
+    const lib = ensureJsQr();
+    lib.catch(() => {});
+    let stream = null;
+    try {
+      stream = await requestCamera();
+      await lib;
+    } catch (err) {
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      if (scanSession !== session) return;
+      showScannerOverlay(await describeCameraError(err), true);
+      return;
+    }
+    if (scanSession !== session) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+
+    session.stream = stream;
+    scannerVideo.srcObject = stream;
+    try {
+      await scannerVideo.play();
+    } catch (e) {
+      void e;
+    }
+    if (scanSession !== session) return;
+    scannerOverlay.hidden = true;
+    setScanStatus('Point the camera at the QR code.', '');
+
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const tick = () => {
-      if (state.stopped) return;
+      if (session.stopped) return;
       const vw = scannerVideo.videoWidth;
       const vh = scannerVideo.videoHeight;
       if (scannerVideo.readyState >= 2 && vw) {
@@ -1018,20 +1110,38 @@
           onCode(hit.data);
           return;
         }
-        if (hit) scannerStatus.textContent = 'That QR code is not a Vaultlink code.';
+        if (hit) setScanStatus('That QR code is not a Vaultlink code.', 'error');
       }
-      state.timer = setTimeout(tick, 120);
+      session.timer = setTimeout(tick, 120);
     };
     tick();
   }
 
-  async function startScan(onCode) {
-    clearMsg();
+  async function decodePhoto(file) {
+    await ensureJsQr();
+    const url = URL.createObjectURL(file);
     try {
-      await openScanner(onCode);
-    } catch (err) {
-      closeScanner();
-      showMsg(describeCameraError(err), 'error');
+      const img = await new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error('Could not read that image.'));
+        image.src = url;
+      });
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      const longest = Math.max(img.naturalWidth, img.naturalHeight);
+      for (const maxSide of [1600, 1000, 640]) {
+        const scale = Math.min(1, maxSide / longest);
+        canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const hit = window.jsQR(data.data, canvas.width, canvas.height, { inversionAttempts: 'attemptBoth' });
+        if (hit && hit.data.indexOf(CODE_PREFIX) === 0) return hit.data;
+      }
+      return null;
+    } finally {
+      URL.revokeObjectURL(url);
     }
   }
 
@@ -1309,6 +1419,36 @@
     if (e.target === scanner) closeScanner();
   });
 
+  scannerPhotoBtn.addEventListener('click', () => {
+    if (!scanSession) return;
+    stopCamera(scanSession);
+    showScannerOverlay('Choose a photo or screenshot of the QR code.', false);
+    setScanStatus('', '');
+    scannerPhoto.click();
+  });
+  scannerPhoto.addEventListener('cancel', () => {
+    if (scanSession) startScan(scanSession.onCode);
+  });
+  scannerPhoto.addEventListener('change', async () => {
+    const file = scannerPhoto.files && scannerPhoto.files[0];
+    scannerPhoto.value = '';
+    const session = scanSession;
+    if (!file || !session) return;
+    setScanStatus('Reading image...', '');
+    try {
+      const code = await decodePhoto(file);
+      if (scanSession !== session) return;
+      if (!code) {
+        setScanStatus('No Vaultlink QR code found in that image. Make sure the whole code is in the photo and try again.', 'error');
+        return;
+      }
+      closeScanner();
+      session.onCode(code);
+    } catch (err) {
+      if (scanSession === session) setScanStatus(err && err.message ? err.message : 'Could not read that image.', 'error');
+    }
+  });
+
   fileInput.addEventListener('change', () => {
     addFiles(fileInput.files);
     fileInput.value = '';
@@ -1348,7 +1488,7 @@
   });
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (scanState) {
+    if (scanSession) {
       closeScanner();
       return;
     }
