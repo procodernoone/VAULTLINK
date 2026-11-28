@@ -6,6 +6,7 @@
   const BUFFER_HIGH = 1048576;
   const BUFFER_LOW = 262144;
   const ICE_GATHER_TIMEOUT = 7000;
+  const ICE_IDLE_WAIT = 2500;
   const CODE_PREFIX = 'VL2.';
   const MAX_CANDIDATES = 12;
   const KIND_NAMES = ['host', 'srflx', 'relay', 'prflx'];
@@ -19,6 +20,12 @@
       { urls: 'stun:stun.cloudflare.com:3478' }
     ]
   };
+
+  const QR_ECC_BLOCK = [0, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26];
+  const QR_BLOCKS = [0, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16];
+  const QR_MAX_VERSION = 20;
+  const QR_FINDER_A = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0].map(Boolean);
+  const QR_FINDER_B = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1].map(Boolean);
 
   const STATUS_TEXT = {
     new: 'Waiting for peer',
@@ -64,13 +71,23 @@
   const btnCreate = $('btn-create');
   const btnFinish = $('btn-finish');
   const btnReply = $('btn-reply');
+  const btnScanReply = $('btn-scan-reply');
+  const btnScanInvite = $('btn-scan-invite');
   const btnDisconnect = $('btn-disconnect');
   const btnCopyInvite = $('btn-copy-invite');
   const btnCopyReply = $('btn-copy-reply');
   const inviteOut = $('invite-out');
+  const inviteQrWrap = $('invite-qr-wrap');
+  const inviteQr = $('invite-qr');
   const replyIn = $('reply-in');
   const inviteIn = $('invite-in');
   const replyOut = $('reply-out');
+  const replyQrWrap = $('reply-qr-wrap');
+  const replyQr = $('reply-qr');
+  const scanner = $('scanner');
+  const scannerVideo = $('scanner-video');
+  const scannerStatus = $('scanner-status');
+  const scannerClose = $('scanner-close');
   const dropzone = $('dropzone');
   const fileInput = $('file-input');
   const queueList = $('queue');
@@ -90,6 +107,7 @@
   let sending = false;
   let uid = 0;
   let objectUrls = [];
+  let scanState = null;
 
   function hexToBytes(hex) {
     const out = [];
@@ -335,6 +353,314 @@
     return { type, sdp };
   }
 
+  function qrRawModules(ver) {
+    let n = (16 * ver + 128) * ver + 64;
+    if (ver >= 2) {
+      const a = Math.floor(ver / 7) + 2;
+      n -= (25 * a - 10) * a - 55;
+      if (ver >= 7) n -= 36;
+    }
+    return n;
+  }
+
+  function qrDataCodewords(ver) {
+    return Math.floor(qrRawModules(ver) / 8) - QR_ECC_BLOCK[ver] * QR_BLOCKS[ver];
+  }
+
+  function qrAlignPositions(ver) {
+    if (ver === 1) return [];
+    const count = Math.floor(ver / 7) + 2;
+    const size = ver * 4 + 17;
+    const step = Math.ceil((ver * 4 + 4) / (count * 2 - 2)) * 2;
+    const out = [6];
+    for (let pos = size - 7; out.length < count; pos -= step) out.splice(1, 0, pos);
+    return out;
+  }
+
+  function gfMul(x, y) {
+    let z = 0;
+    for (let i = 7; i >= 0; i -= 1) {
+      z = (z << 1) ^ ((z >>> 7) * 0x11d);
+      z ^= ((y >>> i) & 1) * x;
+    }
+    return z;
+  }
+
+  function rsDivisor(degree) {
+    const result = new Array(degree).fill(0);
+    result[degree - 1] = 1;
+    let root = 1;
+    for (let i = 0; i < degree; i += 1) {
+      for (let j = 0; j < degree; j += 1) {
+        result[j] = gfMul(result[j], root);
+        if (j + 1 < degree) result[j] ^= result[j + 1];
+      }
+      root = gfMul(root, 2);
+    }
+    return result;
+  }
+
+  function rsRemainder(data, divisor) {
+    const result = divisor.map(() => 0);
+    for (const b of data) {
+      const factor = b ^ result.shift();
+      result.push(0);
+      divisor.forEach((coef, i) => { result[i] ^= gfMul(coef, factor); });
+    }
+    return result;
+  }
+
+  function qrInterleave(data, ver) {
+    const numBlocks = QR_BLOCKS[ver];
+    const eccLen = QR_ECC_BLOCK[ver];
+    const rawWords = Math.floor(qrRawModules(ver) / 8);
+    const numShort = numBlocks - (rawWords % numBlocks);
+    const shortLen = Math.floor(rawWords / numBlocks);
+    const divisor = rsDivisor(eccLen);
+    const blocks = [];
+    for (let i = 0, k = 0; i < numBlocks; i += 1) {
+      const len = shortLen - eccLen + (i < numShort ? 0 : 1);
+      const dat = data.slice(k, k + len);
+      k += len;
+      const ecc = rsRemainder(dat, divisor);
+      if (i < numShort) dat.push(0);
+      blocks.push(dat.concat(ecc));
+    }
+    const out = [];
+    for (let i = 0; i < blocks[0].length; i += 1) {
+      blocks.forEach((block, j) => {
+        if (i !== shortLen - eccLen || j >= numShort) out.push(block[i]);
+      });
+    }
+    return out;
+  }
+
+  function qrMaskBit(m, x, y) {
+    switch (m) {
+      case 0: return (x + y) % 2 === 0;
+      case 1: return y % 2 === 0;
+      case 2: return x % 3 === 0;
+      case 3: return (x + y) % 3 === 0;
+      case 4: return (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0;
+      case 5: return ((x * y) % 2) + ((x * y) % 3) === 0;
+      case 6: return ((((x * y) % 2) + ((x * y) % 3)) % 2) === 0;
+      default: return ((((x + y) % 2) + ((x * y) % 3)) % 2) === 0;
+    }
+  }
+
+  function qrBuildMatrix(ver, codewords) {
+    const size = ver * 4 + 17;
+    const modules = [];
+    const fn = [];
+    for (let y = 0; y < size; y += 1) {
+      modules.push(new Array(size).fill(false));
+      fn.push(new Array(size).fill(false));
+    }
+    const setFn = (x, y, dark) => {
+      modules[y][x] = dark;
+      fn[y][x] = true;
+    };
+    const bit = (v, i) => ((v >>> i) & 1) !== 0;
+
+    const finder = (cx, cy) => {
+      for (let dy = -4; dy <= 4; dy += 1) {
+        for (let dx = -4; dx <= 4; dx += 1) {
+          const x = cx + dx;
+          const y = cy + dy;
+          if (x >= 0 && x < size && y >= 0 && y < size) {
+            const d = Math.max(Math.abs(dx), Math.abs(dy));
+            setFn(x, y, d !== 2 && d !== 4);
+          }
+        }
+      }
+    };
+
+    const align = (cx, cy) => {
+      for (let dy = -2; dy <= 2; dy += 1) {
+        for (let dx = -2; dx <= 2; dx += 1) {
+          setFn(cx + dx, cy + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+        }
+      }
+    };
+
+    const drawFormat = (mask) => {
+      let rem = mask;
+      for (let i = 0; i < 10; i += 1) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+      const bits = ((mask << 10) | rem) ^ 0x5412;
+      for (let i = 0; i <= 5; i += 1) setFn(8, i, bit(bits, i));
+      setFn(8, 7, bit(bits, 6));
+      setFn(8, 8, bit(bits, 7));
+      setFn(7, 8, bit(bits, 8));
+      for (let i = 9; i < 15; i += 1) setFn(14 - i, 8, bit(bits, i));
+      for (let i = 0; i < 8; i += 1) setFn(size - 1 - i, 8, bit(bits, i));
+      for (let i = 8; i < 15; i += 1) setFn(8, size - 15 + i, bit(bits, i));
+      setFn(8, size - 8, true);
+    };
+
+    const drawVersion = () => {
+      if (ver < 7) return;
+      let rem = ver;
+      for (let i = 0; i < 12; i += 1) rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+      const bits = (ver << 12) | rem;
+      for (let i = 0; i < 18; i += 1) {
+        const color = bit(bits, i);
+        const a = size - 11 + (i % 3);
+        const b = Math.floor(i / 3);
+        setFn(a, b, color);
+        setFn(b, a, color);
+      }
+    };
+
+    for (let i = 0; i < size; i += 1) {
+      setFn(6, i, i % 2 === 0);
+      setFn(i, 6, i % 2 === 0);
+    }
+    finder(3, 3);
+    finder(size - 4, 3);
+    finder(3, size - 4);
+    const pos = qrAlignPositions(ver);
+    for (let i = 0; i < pos.length; i += 1) {
+      for (let j = 0; j < pos.length; j += 1) {
+        const corner = (i === 0 && j === 0) || (i === 0 && j === pos.length - 1) || (i === pos.length - 1 && j === 0);
+        if (!corner) align(pos[i], pos[j]);
+      }
+    }
+    drawFormat(0);
+    drawVersion();
+
+    let bitIndex = 0;
+    for (let right = size - 1; right >= 1; right -= 2) {
+      if (right === 6) right = 5;
+      for (let vert = 0; vert < size; vert += 1) {
+        for (let j = 0; j < 2; j += 1) {
+          const x = right - j;
+          const upward = ((right + 1) & 2) === 0;
+          const y = upward ? size - 1 - vert : vert;
+          if (!fn[y][x] && bitIndex < codewords.length * 8) {
+            modules[y][x] = bit(codewords[bitIndex >>> 3], 7 - (bitIndex & 7));
+            bitIndex += 1;
+          }
+        }
+      }
+    }
+
+    const applyMask = (m) => {
+      for (let y = 0; y < size; y += 1) {
+        for (let x = 0; x < size; x += 1) {
+          if (!fn[y][x] && qrMaskBit(m, x, y)) modules[y][x] = !modules[y][x];
+        }
+      }
+    };
+
+    const scanLine = (line) => {
+      let score = 0;
+      let run = 1;
+      for (let i = 1; i < size; i += 1) {
+        if (line[i] === line[i - 1]) {
+          run += 1;
+          if (run === 5) score += 3;
+          else if (run > 5) score += 1;
+        } else {
+          run = 1;
+        }
+      }
+      for (let i = 0; i + 11 <= size; i += 1) {
+        let a = true;
+        let b = true;
+        for (let k = 0; k < 11; k += 1) {
+          if (line[i + k] !== QR_FINDER_A[k]) a = false;
+          if (line[i + k] !== QR_FINDER_B[k]) b = false;
+        }
+        if (a || b) score += 40;
+      }
+      return score;
+    };
+
+    const penalty = () => {
+      let total = 0;
+      let dark = 0;
+      for (let y = 0; y < size; y += 1) {
+        total += scanLine(modules[y]);
+        const col = [];
+        for (let x = 0; x < size; x += 1) {
+          col.push(modules[x][y]);
+          if (modules[y][x]) dark += 1;
+        }
+        total += scanLine(col);
+      }
+      for (let y = 0; y < size - 1; y += 1) {
+        for (let x = 0; x < size - 1; x += 1) {
+          const c = modules[y][x];
+          if (c === modules[y][x + 1] && c === modules[y + 1][x] && c === modules[y + 1][x + 1]) total += 3;
+        }
+      }
+      const cells = size * size;
+      const k = Math.ceil(Math.abs(dark * 20 - cells * 10) / cells) - 1;
+      return total + Math.max(0, k) * 10;
+    };
+
+    let bestMask = 0;
+    let best = Infinity;
+    for (let m = 0; m < 8; m += 1) {
+      applyMask(m);
+      drawFormat(m);
+      const p = penalty();
+      if (p < best) {
+        best = p;
+        bestMask = m;
+      }
+      applyMask(m);
+    }
+    applyMask(bestMask);
+    drawFormat(bestMask);
+    return modules;
+  }
+
+  function qrEncode(text) {
+    const data = [];
+    for (let i = 0; i < text.length; i += 1) data.push(text.charCodeAt(i) & 255);
+    let ver = 1;
+    while (ver <= QR_MAX_VERSION && 4 + (ver < 10 ? 8 : 16) + data.length * 8 > qrDataCodewords(ver) * 8) ver += 1;
+    if (ver > QR_MAX_VERSION) throw new Error('This code is too long for a QR code.');
+    const bits = [];
+    const put = (val, len) => {
+      for (let i = len - 1; i >= 0; i -= 1) bits.push((val >>> i) & 1);
+    };
+    put(4, 4);
+    put(data.length, ver < 10 ? 8 : 16);
+    data.forEach((b) => put(b, 8));
+    const capacity = qrDataCodewords(ver) * 8;
+    put(0, Math.min(4, capacity - bits.length));
+    put(0, (8 - (bits.length % 8)) % 8);
+    const words = [];
+    for (let i = 0; i < bits.length; i += 8) {
+      let v = 0;
+      for (let j = 0; j < 8; j += 1) v = (v << 1) | bits[i + j];
+      words.push(v);
+    }
+    for (let pad = 0xec; words.length < qrDataCodewords(ver); pad ^= 0xec ^ 0x11) words.push(pad);
+    return qrBuildMatrix(ver, qrInterleave(words, ver));
+  }
+
+  function drawQr(canvas, text) {
+    const matrix = qrEncode(text);
+    const n = matrix.length;
+    const quiet = 4;
+    const scale = Math.max(3, Math.floor(520 / (n + quiet * 2)));
+    const px = (n + quiet * 2) * scale;
+    canvas.width = px;
+    canvas.height = px;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, px, px);
+    ctx.fillStyle = '#000000';
+    for (let y = 0; y < n; y += 1) {
+      for (let x = 0; x < n; x += 1) {
+        if (matrix[y][x]) ctx.fillRect((x + quiet) * scale, (y + quiet) * scale, scale, scale);
+      }
+    }
+  }
+
   function setStatus(kind, text) {
     dot.dataset.state = kind;
     statusText.textContent = text;
@@ -377,16 +703,29 @@
     if (location.protocol === 'file:') {
       lines.push('This page was opened from a file:// address. WebRTC needs http://localhost or https://. Serve this folder, for example with "python3 -m http.server 8000", then open http://localhost:8000.');
     } else if (window.isSecureContext === false) {
-      lines.push('This page is not in a secure context. WebRTC and clipboard access need http://localhost or https://.');
+      lines.push('This page is not in a secure context. WebRTC, camera and clipboard access need http://localhost or https://.');
     }
     if (!window.RTCPeerConnection) {
       lines.push('This browser does not support WebRTC.');
       [btnCreate, btnFinish, btnReply].forEach((b) => { b.disabled = true; });
     }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      [btnScanReply, btnScanInvite].forEach((b) => {
+        b.disabled = true;
+        b.title = 'Camera access needs https:// or http://localhost';
+      });
+    }
     if (lines.length) {
       warningText.textContent = lines.join(' ');
       warning.hidden = false;
     }
+  }
+
+  function registerServiceWorker() {
+    if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    });
   }
 
   function normalizeState(peer) {
@@ -432,17 +771,30 @@
         resolve();
         return;
       }
-      let timer = null;
+      let idle = null;
+      let cap = null;
       const finish = () => {
-        clearTimeout(timer);
-        peer.removeEventListener('icegatheringstatechange', check);
+        clearTimeout(idle);
+        clearTimeout(cap);
+        peer.removeEventListener('icecandidate', onCandidate);
+        peer.removeEventListener('icegatheringstatechange', onState);
         resolve();
       };
-      const check = () => {
+      const onCandidate = (e) => {
+        if (!e.candidate) {
+          finish();
+          return;
+        }
+        clearTimeout(idle);
+        idle = setTimeout(finish, ICE_IDLE_WAIT);
+      };
+      const onState = () => {
         if (peer.iceGatheringState === 'complete') finish();
       };
-      timer = setTimeout(finish, ICE_GATHER_TIMEOUT);
-      peer.addEventListener('icegatheringstatechange', check);
+      idle = setTimeout(finish, ICE_IDLE_WAIT);
+      cap = setTimeout(finish, ICE_GATHER_TIMEOUT);
+      peer.addEventListener('icecandidate', onCandidate);
+      peer.addEventListener('icegatheringstatechange', onState);
     });
   }
 
@@ -478,19 +830,35 @@
     setTimeout(() => { btn.textContent = label; }, 1600);
   }
 
-  function setOutput(field, btn, value) {
+  function setOutput(field, btn, value, qrWrap, qrCanvas) {
     field.value = value;
     btn.disabled = !value;
+    qrWrap.hidden = !value;
+    if (!value) return;
+    try {
+      drawQr(qrCanvas, value);
+    } catch (e) {
+      qrWrap.hidden = true;
+    }
+  }
+
+  function setInvite(value) {
+    setOutput(inviteOut, btnCopyInvite, value, inviteQrWrap, inviteQr);
+  }
+
+  function setReply(value) {
+    setOutput(replyOut, btnCopyReply, value, replyQrWrap, replyQr);
   }
 
   function resetSignaling() {
-    setOutput(inviteOut, btnCopyInvite, '');
-    setOutput(replyOut, btnCopyReply, '');
+    setInvite('');
+    setReply('');
     replyIn.value = '';
     inviteIn.value = '';
   }
 
   function setConnected(on) {
+    if (on) closeScanner();
     connectBody.hidden = on;
     connectedBox.hidden = !on;
     updateSendControls();
@@ -548,13 +916,13 @@
   async function createInvite() {
     const peer = createPeer();
     bindChannel(peer.createDataChannel('vaultlink', { ordered: true }));
-    setOutput(inviteOut, btnCopyInvite, '');
+    setInvite('');
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
     await waitForGathering(peer);
     if (peer !== pc) return;
-    setOutput(inviteOut, btnCopyInvite, encodeDescription(peer.localDescription));
-    showMsg('Invite ready. Copy it, send it, then paste the reply you get back.', 'ok');
+    setInvite(encodeDescription(peer.localDescription));
+    showMsg('Invite ready. Let the other device scan the QR code, or copy the code and send it.', 'ok');
   }
 
   async function finishConnection() {
@@ -570,14 +938,14 @@
     const remote = decodeDescription(inviteIn.value, 'offer');
     const peer = createPeer();
     peer.addEventListener('datachannel', (e) => bindChannel(e.channel));
-    setOutput(replyOut, btnCopyReply, '');
+    setReply('');
     await peer.setRemoteDescription(remote);
     const answer = await peer.createAnswer();
     await peer.setLocalDescription(answer);
     await waitForGathering(peer);
     if (peer !== pc) return;
-    setOutput(replyOut, btnCopyReply, encodeDescription(peer.localDescription));
-    showMsg('Reply ready. Copy it and send it back. This page connects once they finish.', 'ok');
+    setReply(encodeDescription(peer.localDescription));
+    showMsg('Reply ready. Let the other device scan this QR code, or copy the code and send it back.', 'ok');
   }
 
   function disconnect() {
@@ -587,6 +955,84 @@
     resetSignaling();
     clearMsg();
     setStatus('idle', 'Not connected');
+  }
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Could not load the QR scanner library (jsQR.js).'));
+      document.head.appendChild(s);
+    });
+  }
+
+  function describeCameraError(err) {
+    if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
+      return 'Camera permission was denied. Allow camera access for this site and try again.';
+    }
+    if (err && err.name === 'NotFoundError') return 'No camera was found on this device.';
+    return err && err.message ? err.message : 'Could not start the camera.';
+  }
+
+  function closeScanner() {
+    if (!scanState) return;
+    scanState.stopped = true;
+    clearTimeout(scanState.timer);
+    scanState.stream.getTracks().forEach((t) => t.stop());
+    scannerVideo.srcObject = null;
+    scanState = null;
+    scanner.hidden = true;
+  }
+
+  async function openScanner(onCode) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Camera access needs https:// or http://localhost.');
+    }
+    if (!window.jsQR) await loadScript('jsQR.js');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } },
+      audio: false
+    });
+    const state = { stream, stopped: false, timer: null };
+    scanState = state;
+    scannerVideo.srcObject = stream;
+    scanner.hidden = false;
+    scannerStatus.textContent = 'Point the camera at the QR code.';
+    await scannerVideo.play();
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const tick = () => {
+      if (state.stopped) return;
+      const vw = scannerVideo.videoWidth;
+      const vh = scannerVideo.videoHeight;
+      if (scannerVideo.readyState >= 2 && vw) {
+        const scale = Math.min(1, 800 / vw);
+        canvas.width = Math.round(vw * scale);
+        canvas.height = Math.round(vh * scale);
+        ctx.drawImage(scannerVideo, 0, 0, canvas.width, canvas.height);
+        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const hit = window.jsQR(img.data, canvas.width, canvas.height, { inversionAttempts: 'dontInvert' });
+        if (hit && hit.data.indexOf(CODE_PREFIX) === 0) {
+          closeScanner();
+          onCode(hit.data);
+          return;
+        }
+        if (hit) scannerStatus.textContent = 'That QR code is not a Vaultlink code.';
+      }
+      state.timer = setTimeout(tick, 120);
+    };
+    tick();
+  }
+
+  async function startScan(onCode) {
+    clearMsg();
+    try {
+      await openScanner(onCode);
+    } catch (err) {
+      closeScanner();
+      showMsg(describeCameraError(err), 'error');
+    }
   }
 
   function el(tag, cls, text) {
@@ -846,6 +1292,23 @@
   btnCopyInvite.addEventListener('click', () => copyField(inviteOut, btnCopyInvite));
   btnCopyReply.addEventListener('click', () => copyField(replyOut, btnCopyReply));
 
+  btnScanReply.addEventListener('click', () => {
+    startScan((code) => {
+      replyIn.value = code;
+      btnFinish.click();
+    });
+  });
+  btnScanInvite.addEventListener('click', () => {
+    startScan((code) => {
+      inviteIn.value = code;
+      btnReply.click();
+    });
+  });
+  scannerClose.addEventListener('click', closeScanner);
+  scanner.addEventListener('click', (e) => {
+    if (e.target === scanner) closeScanner();
+  });
+
   fileInput.addEventListener('change', () => {
     addFiles(fileInput.files);
     fileInput.value = '';
@@ -884,7 +1347,12 @@
     if (!creditMenu.hidden && !creditMenu.contains(e.target) && e.target !== creditBtn) setMenu(false);
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !creditMenu.hidden) {
+    if (e.key !== 'Escape') return;
+    if (scanState) {
+      closeScanner();
+      return;
+    }
+    if (!creditMenu.hidden) {
       setMenu(false);
       creditBtn.focus();
     }
@@ -893,11 +1361,13 @@
   logo.addEventListener('error', () => logo.classList.add('is-missing'));
 
   window.addEventListener('pagehide', () => {
+    closeScanner();
     teardown();
     objectUrls.forEach((u) => URL.revokeObjectURL(u));
     objectUrls = [];
   });
 
   checkEnvironment();
+  registerServiceWorker();
   updateSendControls();
 })();
